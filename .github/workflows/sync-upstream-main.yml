@@ -1,0 +1,49 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fast-forward from upstream when available
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An unavailable, renamed, archived, or deleted upstream is non-fatal:
+          # no history in this repository is deleted or rewritten.
+          if ! git ls-remote --exit-code https://github.com/MddIdd/mdd-sim-gateway.git refs/heads/main >/dev/null 2>&1; then
+            echo "Upstream main is unavailable; retaining this repository unchanged."
+            exit 0
+          fi
+
+          git remote add upstream https://github.com/MddIdd/mdd-sim-gateway.git
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main)" ]; then
+              echo "Already current."
+            else
+              git merge --ff-only upstream/main
+              git push origin HEAD:main
+            fi
+          else
+            echo "Local main has diverged; not changing it automatically."
+            exit 0
+          fi
