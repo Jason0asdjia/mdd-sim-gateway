@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fast-forward from upstream when available
+      - name: Merge upstream main safely when available
         shell: bash
         run: |
           set -euo pipefail
@@ -36,14 +36,14 @@ jobs:
 
           git remote add upstream https://github.com/MddIdd/mdd-sim-gateway.git
           git fetch --no-tags upstream main
-          if git merge-base --is-ancestor HEAD upstream/main; then
-            if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main)" ]; then
-              echo "Already current."
-            else
-              git merge --ff-only upstream/main
-              git push origin HEAD:main
-            fi
-          else
-            echo "Local main has diverged; not changing it automatically."
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main)" ]; then
+            echo "Already current."
             exit 0
           fi
+
+          # Preserve local commits. A conflict makes the job fail without pushing,
+          # so manual review is required rather than risking an incorrect merge.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
