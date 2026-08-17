@@ -28,6 +28,9 @@ MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 
 
 推荐使用具备 systemd、Docker、USB 和稳定网络的 Debian、Ubuntu 或 Armbian ARM64 主机。
 
+Windows 11 可通过 WSL2 + usbipd-win 混合部署；USB 转发、同发行版原生 Docker 与常驻限制
+见 [Windows 11 + WSL2 部署](docs/WSL2.md)。
+
 ```bash
 git clone https://github.com/MddIdd/mdd-sim-gateway.git
 cd mdd-sim-gateway
@@ -77,12 +80,14 @@ sudo ./install.sh install
 | 设备 | 4G 数据 | Wi‑Fi Calling | SIM 访问方式 |
 |---|---:|---:|---|
 | 支持 ModemManager 的蜂窝模块 | ✓ | ✓ | 模块 AT/逻辑通道桥接 |
-| 大疆/Quectel EC25 类模块 | ✓ | ✓ | 自动识别并创建所需虚拟读卡通道 |
+| 大疆/Quectel EC25 类模块（含首代出厂 ID `2ca3:4006`） | ✓* | ✓ | 自动识别并创建所需虚拟读卡通道 |
 | USB PC/SC 读卡器 | — | ✓ | 直接 PC/SC |
 | 三体电子 SCR Prime（`04d9:c001`） | — | ✓ | 直接 PC/SC；安装时使用 `patchprime` 驱动补丁 |
 | eUICC/eSIM 读卡器 | — | ✓ | PC/SC + lpac |
 
 三体电子 SCR Prime 已通过本项目实机验证；“支持”表示系统具备相应技术路径，不代表所有 SIM、固件或运营商都会放行。多模块 4G 使用独立 ModemManager 对象、NetworkManager 连接和 bearer。
+
+\* 首代 `2ca3:4006` 会自动安装串口绑定规则；完整 4G/QMI 仍取决于内核、USB 接口布局和 ModemManager 是否成功创建 modem 对象。
 
 
 ## 安装器会做什么

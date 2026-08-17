@@ -3,8 +3,12 @@
 ## 支持环境
 
 - 推荐 ARM64 Debian、Ubuntu 或 Armbian，systemd 可用。
+- Windows 11 可使用 WSL2 + usbipd-win 混合部署；必须启用 systemd，并在同一 WSL2
+  发行版内运行原生 Docker Engine。完整步骤和常驻限制见 [Windows 11 + WSL2](WSL2.md)。
 - Docker、USB、内核 TUN、pcscd；蜂窝模块还需要 ModemManager/NetworkManager。
 - 已实机验证的三体电子 SCR Prime（`04d9:c001`）提供标准 CCID 接口，但尚未进入 libccid 1.6.2 的设备表。连接该型号时执行 `sudo ./install.sh patchprime`，安装程序会从校验过的固定版本源码构建驱动并加入设备匹配；完成后支持热插拔。
+- 首代 DJI Cellular Dongle 的出厂 USB ID 可为 `2ca3:4006`。安装器会添加可审计的
+  udev 规则来绑定串口，不修改模块 NVRAM；完整 4G/QMI 仍以 `mmcli -L` 成功列出对象为准。
 - 至少 4 GB 可用磁盘。首次构建 Asterisk 在低功耗设备上可能需要 20–30 分钟。
 - 全新 Engine 构建会按固定提交从 `gitea.sysmocom.de` 获取 sysmocom 的 pjproject 与
   Asterisk 源码。安装主机必须能通过 HTTPS 访问该站点；部分云服务商网络可能被上游
@@ -23,6 +27,9 @@ sudo ./install.sh install --mode docker   # 控制面也运行在 Docker
 `MDD_DATA_DIR` 在首次安装后会写入系统状态；后续执行 `status`、`reload` 和 `uninstall` 时不必再次填写，避免自定义数据目录被误判为新安装。
 
 如果系统 Docker 已经可以连接，安装脚本只复用它，不升级版本、不修改 daemon 配置、不执行 prune，也不操作其他项目的容器或镜像。MDD 容器带有归属标签；发现同名外部容器、8443 端口冲突或 rootless Docker 时会停止并给出错误。蜂窝与 TUN/PCSC 引擎需要系统级 Docker daemon，因此不支持 rootless 模式。
+
+WSL2 中不要让 `docker` 指向 Docker Desktop 的远程 daemon。安装器只在检测到 WSL 时
+清除 Ubuntu ModemManager 单元的容器启动条件，不改变普通 Linux、Docker 或 LXC 的默认保护。
 
 版本检查始终使用 GitHub Release API，不读取或发送 GitHub Token。配置的仓库不可访问或尚未发布 Release 时，界面会显示尚无可用发布版本。
 

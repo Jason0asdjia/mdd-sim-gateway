@@ -28,6 +28,7 @@ _ORCH_DIR = os.path.join(cfg.DATA_DIR, "orchestrator")
 _DESIRED = os.path.join(_ORCH_DIR, "desired.json")
 _STATUS = os.path.join(_ORCH_DIR, "proxy-status.json")
 _RESELECT = os.path.join(_ORCH_DIR, "exit-reselect.json")
+_VOWIFI_FAILURES = os.path.join(_ORCH_DIR, "exit-vowifi-failures.json")
 # A line healthy at least this long has proved its exit node can carry IMS.
 RESELECT_MIN_STABLE_SECONDS = float(os.environ.get("MDD_EXIT_RESELECT_MIN_STABLE", "600"))
 
@@ -48,6 +49,13 @@ def _recv_exact(stream: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _recv_stage(stream: socket.socket, size: int, timeout_message: str) -> bytes:
+    try:
+        return _recv_exact(stream, size)
+    except (socket.timeout, TimeoutError) as exc:
+        raise EgressError(timeout_message) from exc
+
+
 def test_udp_proxy(host: str, port: int, timeout: float = 8.0,
                    username: str = "", password: str = "") -> int:
     """Send one DNS query through a SOCKS5 UDP ASSOCIATE and return latency in ms.
@@ -57,35 +65,44 @@ def test_udp_proxy(host: str, port: int, timeout: float = 8.0,
     """
     started = time.monotonic()
     try:
-        with socket.create_connection((host, int(port)), timeout=timeout) as stream:
+        try:
+            stream_connection = socket.create_connection((host, int(port)), timeout=timeout)
+        except (socket.timeout, TimeoutError) as exc:
+            raise EgressError("SOCKS5 server connection timed out") from exc
+        with stream_connection as stream:
             stream.settimeout(timeout)
             methods = b"\x00\x02" if username or password else b"\x00"
             stream.sendall(b"\x05" + bytes([len(methods)]) + methods)
-            method = _recv_exact(stream, 2)
+            method = _recv_stage(stream, 2, "SOCKS5 negotiation timed out")
             if method == b"\x05\x02":
                 user, secret = username.encode(), password.encode()
                 if not user or len(user) > 255 or len(secret) > 255:
                     raise EgressError("SOCKS5 username or password is invalid")
                 stream.sendall(b"\x01" + bytes([len(user)]) + user
                                + bytes([len(secret)]) + secret)
-                if _recv_exact(stream, 2) != b"\x01\x00":
+                if _recv_stage(stream, 2, "SOCKS5 authentication timed out") != b"\x01\x00":
                     raise EgressError("SOCKS5 username or password was rejected")
             elif method != b"\x05\x00":
                 raise EgressError("SOCKS5 proxy rejected UDP test negotiation")
             stream.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
-            head = _recv_exact(stream, 4)
+            head = _recv_stage(stream, 4, "SOCKS5 UDP associate timed out")
             if head[:2] != b"\x05\x00":
                 raise EgressError(f"SOCKS5 proxy rejected UDP associate (code {head[1]})")
             atyp = head[3]
             if atyp == 1:
-                relay_host = socket.inet_ntoa(_recv_exact(stream, 4))
+                relay_host = socket.inet_ntoa(_recv_stage(
+                    stream, 4, "SOCKS5 UDP relay address timed out"))
             elif atyp == 3:
-                relay_host = _recv_exact(stream, _recv_exact(stream, 1)[0]).decode("ascii")
+                relay_size = _recv_stage(stream, 1, "SOCKS5 UDP relay address timed out")[0]
+                relay_host = _recv_stage(
+                    stream, relay_size, "SOCKS5 UDP relay address timed out").decode("ascii")
             elif atyp == 4:
-                relay_host = socket.inet_ntop(socket.AF_INET6, _recv_exact(stream, 16))
+                relay_host = socket.inet_ntop(socket.AF_INET6, _recv_stage(
+                    stream, 16, "SOCKS5 UDP relay address timed out"))
             else:
                 raise EgressError("SOCKS5 proxy returned an invalid UDP relay address")
-            relay_port = struct.unpack("!H", _recv_exact(stream, 2))[0]
+            relay_port = struct.unpack("!H", _recv_stage(
+                stream, 2, "SOCKS5 UDP relay address timed out"))[0]
             if relay_host in {"0.0.0.0", "::"}:
                 relay_host = host
 
@@ -99,7 +116,11 @@ def test_udp_proxy(host: str, port: int, timeout: float = 8.0,
             with socket.socket(family, socket.SOCK_DGRAM) as udp:
                 udp.settimeout(timeout)
                 udp.sendto(packet, (relay_host, relay_port))
-                response, _ = udp.recvfrom(4096)
+                try:
+                    response, _ = udp.recvfrom(4096)
+                except (socket.timeout, TimeoutError) as exc:
+                    raise EgressError(
+                        "SOCKS5 UDP relay accepted the request but returned no response") from exc
             if len(response) < 22 or response[0:3] != b"\x00\x00\x00":
                 raise EgressError("SOCKS5 proxy returned an invalid UDP response")
             # Skip the variable SOCKS destination header before checking the DNS transaction.
@@ -321,7 +342,51 @@ def publish(instances: list[dict] | None = None, settings: dict | None = None) -
 
 
 def status() -> dict:
-    return _read_json(_STATUS)
+    value = _read_json(_STATUS)
+    exits = value.get("exits") or {}
+    failures = (_read_json(_VOWIFI_FAILURES).get("countries") or {})
+    if isinstance(exits, dict) and isinstance(failures, dict):
+        for country, failure in failures.items():
+            current = exits.get(country)
+            if (not isinstance(current, dict) or not isinstance(failure, dict)
+                    or str(current.get("node") or "") != str(failure.get("node") or "")):
+                continue
+            current["vowifi_compatible"] = False
+            current["vowifi_failure"] = failure
+    return value
+
+
+def record_vowifi_failure(inst: dict, node: str, reason: str, strikes: int, action: str):
+    """Publish actual line evidence separately from the basic UDP/DNS probe."""
+    country = line_country(inst)
+    if not country or not node:
+        return
+    document = _read_json(_VOWIFI_FAILURES)
+    countries = document.get("countries")
+    if not isinstance(countries, dict):
+        countries = {}
+    countries[country] = {
+        "node": str(node), "reason": str(reason), "strikes": int(strikes),
+        "action": str(action), "ts": time.time(),
+        "message": ("This node passed the basic UDP test but an actual VoWiFi IKE handshake "
+                    "did not complete through it. VoWiFi requires UDP 500/4500; verify those "
+                    "ports or replace the node."),
+    }
+    _atomic_json(_VOWIFI_FAILURES, {"version": 1, "countries": countries})
+
+
+def clear_vowifi_failure(inst: dict):
+    """Forget stale negative evidence once a line registers through its country exit."""
+    country = line_country(inst)
+    if not country:
+        return
+    document = _read_json(_VOWIFI_FAILURES)
+    countries = document.get("countries")
+    if not isinstance(countries, dict) or country not in countries:
+        return
+    countries = dict(countries)
+    countries.pop(country, None)
+    _atomic_json(_VOWIFI_FAILURES, {"version": 1, "countries": countries})
 
 
 def request_reselect(inst: dict, reason: str, stable_for: float = 0.0) -> str:

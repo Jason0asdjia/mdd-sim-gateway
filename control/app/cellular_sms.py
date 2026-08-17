@@ -100,6 +100,24 @@ def _response(instance_id, *, ok: bool, status: str, error: str | None,
     return response
 
 
+def delete_modem_sms(modem_path: str, sms_path: str, runner=subprocess.run,
+                     *, timeout: float = 10.0) -> bool:
+    """Delete one exact ModemManager SMS object after durable local persistence.
+
+    The modem's tiny SMS store is a transport spool, not the product's history database.
+    Callers must only acknowledge an object after its message row (and import marker, for
+    inbound SMS) has committed. Invalid paths are refused so cleanup can never broaden beyond
+    the one modem object the scanner observed.
+    """
+    if not MODEM_PATH_RE.fullmatch(str(modem_path or "")) \
+            or not SMS_PATH_RE.fullmatch(str(sms_path or "")):
+        return False
+    result, problem = _invoke([
+        "-m", str(modem_path), f"--messaging-delete-sms={sms_path}",
+    ], runner, timeout)
+    return not problem and not getattr(result, "returncode", 1)
+
+
 def _content_hash(recipient: str, text: str) -> str:
     """Stable, non-plaintext identity shared by the sender and receive scanner."""
     return hashlib.sha256(f"{recipient}\0{text}".encode("utf-8")).hexdigest()
@@ -436,6 +454,23 @@ class Scanner:
         self._topology: list[tuple[str, str]] = []
         self._details: dict[tuple[str, str], tuple[float, dict]] = {}
         self._local_sms_keys: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+        self._pending_ack: dict[str, tuple[str, str]] = {}
+
+    def acknowledge(self, fingerprint: str, *, timeout: float = 10.0) -> bool:
+        """Release a discovered SMS from modem storage after the caller committed it locally.
+
+        A failed delete intentionally retains the acknowledgement target; the duplicate import
+        marker lets the next polling cycle retry cleanup without recreating a Web message.
+        """
+        target = self._pending_ack.get(str(fingerprint or ""))
+        if not target:
+            return False
+        modem_path, sms_path = target
+        if not delete_modem_sms(modem_path, sms_path, self.runner, timeout=timeout):
+            return False
+        self._pending_ack.pop(str(fingerprint), None)
+        self._details.pop((modem_path, sms_path), None)
+        return True
 
     def _refresh_topology(self, now: float) -> None:
         topology = []
@@ -471,6 +506,7 @@ class Scanner:
         found = []
         live_keys = set()
         live_local_keys = set()
+        live_ack_fingerprints = set()
         for modem_path, iccid in self._topology:
             iid = by_iccid.get(iccid)
             if not iid:
@@ -520,6 +556,12 @@ class Scanner:
                         continue
                     pdu_type = str(props.get("pdu-type") or "").lower()
                     direction = "out" if pdu_type == "submit" else "in"
+                    sms_state = str(props.get("state") or "").lower()
+                    # A multipart SMS may expose partial text while ModemManager still reports
+                    # ``receiving``. Persisting and deleting it here would discard later parts.
+                    if direction == "in" and sms_state == "receiving":
+                        self._details.pop(key, None)
+                        continue
                     timestamp = str(props.get("timestamp") or "")
                     signature_parts = [iccid, sms_path, direction, peer, text, timestamp]
                     if direction == "out":
@@ -552,6 +594,8 @@ class Scanner:
                     if is_local:
                         continue
                 found.append({**record, "instance": iid})
+                self._pending_ack[record["fingerprint"]] = (modem_path, sms_path)
+                live_ack_fingerprints.add(record["fingerprint"])
             if listing_complete and daemon_epoch and self.local_sms_tracker is not None:
                 pruner = getattr(self.local_sms_tracker, "prune_local_modem_sms", None)
                 if callable(pruner):
@@ -565,6 +609,9 @@ class Scanner:
         for key in list(self._local_sms_keys):
             if key not in live_local_keys:
                 self._local_sms_keys.pop(key, None)
+        self._pending_ack = {fingerprint: target
+                             for fingerprint, target in self._pending_ack.items()
+                             if fingerprint in live_ack_fingerprints}
         return found
 
 

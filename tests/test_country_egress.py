@@ -8,11 +8,30 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from control.app import egress
-from host.mdd_orchestrator import (Orchestrator, clash_outbound, parse_manual_outbound,
+from host.mdd_orchestrator import (Orchestrator, clash_outbound, normalize_subscription,
+                                   parse_manual_outbound,
                                    parse_proxy_url, parse_share_link, xray_xhttp_outbound)
 
 
 class CountryEgressTests(unittest.TestCase):
+    def test_successful_vowifi_registration_clears_stale_exit_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = root / "proxy-status.json"
+            failures_path = root / "exit-vowifi-failures.json"
+            egress._atomic_json(str(status_path), {
+                "exits": {"us": {"node": "node-a", "ready": True}}
+            })
+            inst = {"mcc": "310", "mnc": "240"}
+            with patch.object(egress, "_STATUS", str(status_path)), \
+                    patch.object(egress, "_VOWIFI_FAILURES", str(failures_path)):
+                egress.record_vowifi_failure(inst, "node-a", "tunnel_network", 3, "hold")
+                self.assertFalse(egress.status()["exits"]["us"]["vowifi_compatible"])
+
+                egress.clear_vowifi_failure(inst)
+
+                self.assertNotIn("vowifi_compatible", egress.status()["exits"]["us"])
+
     def test_mcc_mapping_and_override(self):
         self.assertEqual(egress.country_for_mcc("234"), "gb")
         self.assertEqual(egress.line_country({"mcc": "234", "proxy_country": "US"}), "us")
@@ -110,6 +129,34 @@ class SubscriptionNodeConversionTests(unittest.TestCase):
         for absent in ("obfs", "reality", "utls", "alpn"):
             self.assertNotIn(absent, outbound.get("tls", {}))
             self.assertNotIn(absent, outbound)
+
+    def test_base64_shadowsocks_subscription_is_normalized(self):
+        credentials = base64.b64encode(b"aes-128-gcm:secret").decode().rstrip("=")
+        links = "\n".join([
+            f"ss://{credentials}@uk-one.example:8388#UK-London",
+            f"ss://{credentials}@uk-two.example:8389#GB-Manchester",
+        ])
+        payload = base64.b64encode(links.encode()).decode()
+
+        result = normalize_subscription(payload)
+
+        self.assertEqual(len(result["proxies"]), 2)
+        self.assertEqual(result["proxies"][0]["type"], "ss")
+        self.assertEqual(result["proxies"][0]["name"], "UK-London")
+        self.assertEqual(result["proxies"][1]["server"], "uk-two.example")
+
+    def test_clash_subscription_with_string_links_is_normalized(self):
+        credentials = base64.b64encode(b"chacha20-ietf-poly1305:secret").decode().rstrip("=")
+        result = normalize_subscription({
+            "proxies": [f"ss://{credentials}@uk.example:443#UK-01"],
+            "proxy-groups": [{"name": "Auto", "type": "select"}],
+        })
+        self.assertEqual(result["proxies"][0]["name"], "UK-01")
+        self.assertIn("proxy-groups", result)
+
+    def test_invalid_scalar_subscription_has_clear_error(self):
+        with self.assertRaisesRegex(ValueError, "no supported proxy nodes"):
+            normalize_subscription("not a proxy subscription")
 
 
 class PastedNodeTests(unittest.TestCase):
