@@ -15,8 +15,7 @@ FROM fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8e
 # engine's PC/SC client library matches the host pcscd EXACTLY across any distro — this is the
 # same PCSC_VERSION the installer pins on the host and the control image uses. Avoids the
 # client/server protocol mismatch that distro-default pcsc-lite packages cause.
-ARG PCSC_VERSION=2.3.3
-ARG PCSC_SHA256=00b667aa71504ed1d39a48ad377de048c70dbe47229e8c48a3239ab62979c70f
+ARG PCSC_COMMIT=3ef55e02979de6834015b380c1d21671eeb4e9f5
 
 WORKDIR /home/asterisk-build
 
@@ -43,13 +42,20 @@ RUN dnf -y --refresh --setopt=fastestmirror=True --setopt=max_parallel_downloads
 # distro-provided libpcsclite pulled in by python3-pyscard so pyscard (loads libpcsclite.so.1 at
 # runtime) uses the pinned version and talks the same protocol as the host pcscd.
 RUN cd /tmp && \
-    wget -qO pcsc.tar.gz "https://github.com/LudovicRousseau/PCSC/archive/refs/tags/${PCSC_VERSION}.tar.gz" && \
-    echo "${PCSC_SHA256}  pcsc.tar.gz" | sha256sum -c - && \
-    tar xf pcsc.tar.gz && cd "PCSC-${PCSC_VERSION}" && \
+    git init -q pcsc-src && \
+    git -C pcsc-src remote add origin https://github.com/LudovicRousseau/PCSC.git && \
+    attempt=1; while [ "$attempt" -le 5 ]; do \
+      git -C pcsc-src -c http.version=HTTP/1.1 fetch --depth=1 origin "${PCSC_COMMIT}" && break; \
+      [ "$attempt" -lt 5 ] || exit 1; \
+      attempt=$((attempt + 1)); sleep 5; \
+    done && \
+    git -C pcsc-src checkout --detach FETCH_HEAD && \
+    test "$(git -C pcsc-src rev-parse HEAD)" = "${PCSC_COMMIT}" && \
+    cd pcsc-src && \
     meson setup builddir --prefix=/usr -Dpolkit=false && \
     ninja -C builddir && ninja -C builddir install && \
     ldconfig && \
-    rm -rf /tmp/pcsc.tar.gz "/tmp/PCSC-${PCSC_VERSION}"
+    rm -rf /tmp/pcsc-src
 
 # sysmocom pjproject + Asterisk (VoLTE/VoWiFi/IMS-AKA/SMS-over-IMS fork), identical to reference build
 COPY patches/asterisk/ /home/asterisk-build/patches/asterisk/

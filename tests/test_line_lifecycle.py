@@ -869,6 +869,14 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         reselect.assert_not_called()
         to_thread.assert_not_called()
 
+    async def test_a_registered_line_clears_stale_exit_failure_evidence(self):
+        inst = {**self.INST, "retry": {"max": 3, "interval": 40}}
+        with patch.object(main.egress, "clear_vowifi_failure") as clear:
+            result = main.apply_health("9", inst, {"state": "OK", "detail": {}})
+
+        self.assertEqual(result["state"], "OK")
+        clear.assert_called_once_with(inst)
+
     async def test_the_exit_moves_once_the_node_has_had_its_chances(self):
         for _ in range(main.failover.STRIKES_PER_NODE - 1):
             action, reselect, _ = self._judge("CONNECTING", 14)

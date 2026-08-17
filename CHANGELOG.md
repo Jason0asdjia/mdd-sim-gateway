@@ -4,6 +4,31 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Added a Windows 11 + WSL2 deployment guide covering systemd, same-distribution native
+  Docker, usbipd-win attachment/auto-reattachment and always-on limitations.
+- Added built-in discovery and an installer-managed serial binding rule for the first-generation
+  DJI Cellular Dongle factory USB ID `2ca3:4006`, without rewriting modem NVRAM.
+
+### Changed
+
+- eSIM profile switching now resets only the selected modem through ModemManager (with a
+  serialized `AT+CFUN=1,1` fallback), tolerates USB re-enumeration and waits for the requested
+  ICCID to appear before publishing success. WSL2 reports a specific auto-attach recovery error.
+- Proxy tests are now described as basic UDP/DNS checks; actual VoWiFi IKE compatibility is
+  reported separately and recovered status clears stale failure evidence.
+- Clash YAML and Base64 share-link subscriptions are normalized before country-node selection.
+
+### Fixed
+
+- Cellular SMS objects are deleted from the modem only after durable local persistence, with
+  safe retry after a failed acknowledgement; incomplete multipart messages are not imported.
+- PC/SC source builds fetch a pinned upstream commit with bounded retries, avoiding unreliable
+  tag-archive downloads while retaining deterministic source identity.
+- Existing installations gain newly supported built-in modem profiles without losing operator
+  overrides or custom VID/PID entries.
+
 ## [1.3.12] - 2026-08-17
 
 ### Added

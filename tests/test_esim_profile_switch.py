@@ -11,6 +11,52 @@ from host.mdd_orchestrator import Orchestrator
 
 
 class BridgeRestartHandshakeTests(unittest.TestCase):
+    def test_unsupported_modemmanager_reset_uses_serialized_cfun_fallback(self):
+        unsupported = SimpleNamespace(
+            returncode=1, stdout="", stderr="Core.Unsupported: Operation not supported")
+        accepted = SimpleNamespace(returncode=0, stdout="response: OK", stderr="")
+        with patch.object(mdd_orchestrator, "run",
+                          side_effect=[unsupported, accepted]) as execute:
+            ok, method = Orchestrator._reset_modem_for_profile_switch("/modem/7")
+
+        self.assertTrue(ok)
+        self.assertEqual(method, "at-cfun-reset")
+        self.assertEqual(execute.call_args_list[1].args[0][-1], "--command=AT+CFUN=1,1")
+
+    def test_profile_switch_resets_only_the_target_modem_and_tolerates_reenumeration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root)
+            bridge = Mock()
+            bridge.poll.return_value = None
+            app.bridges = {"modem-1": bridge}
+            app._bridge_commands["modem-1"] = [
+                "bridge", "--modemmanager", "/org/freedesktop/ModemManager1/Modem/7"]
+            request_id = "switch-reset"
+            mdd_orchestrator.atomic_json(
+                app.bridge_restart_request_dir / f"{request_id}.json", {
+                    "request_id": request_id, "device_id": "modem-1",
+                    "expected_iccid_sha256": hashlib.sha256(b"profile-target").hexdigest(),
+                    "reset_modem": True,
+                })
+            completed = SimpleNamespace(returncode=0, stdout="reset", stderr="")
+
+            with patch.object(mdd_orchestrator, "run", return_value=completed):
+                app.process_bridge_restart_requests()
+
+            status_path = app.bridge_restart_status_dir / f"{request_id}.json"
+            status = mdd_orchestrator.read_json(status_path)
+            self.assertEqual(status["state"], "resetting")
+            self.assertTrue(app._profile_reset_suppresses_bridge("modem-1"))
+            app.finish_bridge_restart_requests(set())
+            status = mdd_orchestrator.read_json(status_path)
+            self.assertEqual(status["state"], "resetting")
+            self.assertIn("disappeared_at", status)
+
+            app.finish_bridge_restart_requests({"modem-1"})
+            self.assertEqual(mdd_orchestrator.read_json(status_path)["state"],
+                             "reset_complete")
+
     def test_restart_completes_only_for_new_pid_ready_channels_and_target_iccid(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -180,7 +226,7 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_esim_resolve_se", return_value={"id": "se", "aid": "a"}), \
                 patch.object(main.lpa, "profile_enable", new=lambda *_a, **_k: object()), \
                 patch.object(main, "_esim_run", new=AsyncMock()), \
-                patch.object(main, "_esim_cache_update_profile"), \
+                patch.object(main, "_esim_cache_update_profile") as cache_update, \
                 patch.object(main, "_esim_recover_profile_switch",
                              new=AsyncMock(side_effect=error)), \
                 patch.object(main, "_esim_restore_profile_switch",
@@ -189,7 +235,20 @@ class ESimProfileSwitchControlTests(unittest.IsolatedAsyncioTestCase):
                 await main.api_esim_enable("profile-target", {})
 
         restore.assert_not_awaited()
+        cache_update.assert_not_called()
         self.assertNotIn("reader", main.hub.lpa_busy)
+
+    def test_bridge_restart_request_requires_a_real_modem_reset(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(main.cfg, "DATA_DIR", temp):
+            _request_id, status_path = main._esim_write_bridge_restart_request(
+                "modem-1", "profile-target")
+            request_dir = Path(temp) / "orchestrator" / "bridge-restart-requests"
+            request = mdd_orchestrator.read_json(next(request_dir.glob("*.json")))
+
+        self.assertTrue(request["reset_modem"])
+        self.assertNotIn("profile-target", str(request))
+        self.assertTrue(status_path.endswith(".json"))
 
     async def test_lpa_failure_restores_previous_line_snapshot(self):
         previous = {"1": {"enabled": True, "running": True}}

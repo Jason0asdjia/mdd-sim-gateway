@@ -29,6 +29,14 @@ _lock = threading.RLock()
 # deployment configuration.
 MAX_SIM_LINES = 5
 
+# Profiles that are part of the product rather than user configuration. Keep these separate so
+# an older saved config gains newly-supported hardware without losing operator-added profiles.
+BUILTIN_MODEM_PROFILES = [
+    {"name": "DJI/Quectel EC25", "vid": "2c7c", "pid": "0125", "at_interface": 2},
+    {"name": "DJI Cellular 1st gen (factory USB ID)", "vid": "2ca3", "pid": "4006",
+     "at_interface": 2},
+]
+
 
 class LineLimitError(ValueError):
     pass
@@ -90,10 +98,7 @@ DEFAULTS = {
             # For hosts (VMs, containers) where ModemManager's modem objects are unstable.
             "modem_backend": "auto",
             "vpcd_slots": 3,
-            "modem_profiles": [
-                {"name": "DJI/Quectel EC25", "vid": "2c7c", "pid": "0125",
-                 "at_interface": 2},
-            ],
+            "modem_profiles": deepcopy(BUILTIN_MODEM_PROFILES),
         },
         # Outbound push notifications for incoming events (SMS / calls). Every channel is
         # independent and gated on their own `enabled` flag + per-event checkboxes.
@@ -303,6 +308,20 @@ def load() -> dict:
                     "updates"):
             saved = data.get("settings", {}).get(key, {}) or {}
             out["settings"][key] = {**DEFAULTS["settings"][key], **saved}
+        # `modem_profiles` is user-extensible, but built-in hardware support must not become
+        # frozen at the version that first wrote config.yaml. Match case-insensitively by USB
+        # VID/PID and append only missing built-ins, preserving existing profile overrides.
+        hardware = out["settings"]["hardware"]
+        profiles = deepcopy(hardware.get("modem_profiles") or [])
+        present = {
+            (str(profile.get("vid") or "").lower(), str(profile.get("pid") or "").lower())
+            for profile in profiles if isinstance(profile, dict)
+        }
+        profiles.extend(
+            deepcopy(profile) for profile in BUILTIN_MODEM_PROFILES
+            if (profile["vid"], profile["pid"]) not in present
+        )
+        hardware["modem_profiles"] = profiles
         # Proxy profiles were introduced after the original single-subscription/country-form
         # layout.  Expose a lossless v2 view immediately, but do not rewrite config.yaml until
         # the operator next saves Settings.

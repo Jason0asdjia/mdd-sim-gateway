@@ -143,6 +143,77 @@ class CellularSmsTests(unittest.TestCase):
         scanner.discover([{"id": "3", "iccid": "card-a"}])
         self.assertEqual(calls.count(("mmcli", "-L")), 2)
 
+    def test_scanner_acknowledges_only_after_discovery(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/0"
+        sim = "/org/freedesktop/ModemManager1/SIM/0"
+        sms = "/org/freedesktop/ModemManager1/SMS/7"
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-a"}}}))
+            if args == ["mmcli", "-m", modem, "--messaging-list-sms", "--output-json"]:
+                return Result(json.dumps({"modem.messaging.sms": [sms]}))
+            if args == ["mmcli", "-s", sms, "--output-json"]:
+                return Result(json.dumps({"sms": {
+                    "content": {"number": "+44123", "text": "complete"},
+                    "properties": {"pdu-type": "deliver", "state": "received",
+                                   "timestamp": "2026-08-03T00:00:00+08:00"},
+                }}))
+            if args == ["mmcli", "-m", modem, f"--messaging-delete-sms={sms}"]:
+                return Result("")
+            return Result(returncode=1)
+
+        scanner = cellular_sms.Scanner(runner)
+        rows = scanner.discover([{"id": "3", "iccid": "card-a"}])
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(any("--messaging-delete-sms" in " ".join(call) for call in calls))
+        self.assertTrue(scanner.acknowledge(rows[0]["fingerprint"]))
+        self.assertIn(("mmcli", "-m", modem, f"--messaging-delete-sms={sms}"), calls)
+
+    def test_scanner_does_not_import_or_delete_incomplete_sms(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/0"
+        sim = "/org/freedesktop/ModemManager1/SIM/0"
+        sms = "/org/freedesktop/ModemManager1/SMS/8"
+        calls = []
+
+        def runner(args, **_kwargs):
+            calls.append(tuple(args))
+            if args == ["mmcli", "-L"]:
+                return Result(modem)
+            if args == ["mmcli", "-m", modem, "--output-json"]:
+                return Result(json.dumps({"modem": {"generic": {"sim": sim}}}))
+            if args == ["mmcli", "-i", sim, "--output-json"]:
+                return Result(json.dumps({"sim": {"properties": {"iccid": "card-a"}}}))
+            if args == ["mmcli", "-m", modem, "--messaging-list-sms", "--output-json"]:
+                return Result(json.dumps({"modem.messaging.sms": [sms]}))
+            if args == ["mmcli", "-s", sms, "--output-json"]:
+                return Result(json.dumps({"sms": {
+                    "content": {"number": "+44123", "text": "partial"},
+                    "properties": {"pdu-type": "deliver", "state": "receiving"},
+                }}))
+            return Result(returncode=1)
+
+        scanner = cellular_sms.Scanner(runner)
+        self.assertEqual(scanner.discover([{"id": "3", "iccid": "card-a"}]), [])
+        self.assertFalse(scanner.acknowledge("missing"))
+        self.assertFalse(any("--messaging-delete-sms" in " ".join(call) for call in calls))
+
+    def test_failed_acknowledgement_can_be_retried(self):
+        modem = "/org/freedesktop/ModemManager1/Modem/0"
+        sms = "/org/freedesktop/ModemManager1/SMS/9"
+        attempts = [Result(returncode=1), Result("")]
+
+        scanner = cellular_sms.Scanner(lambda *_a, **_k: attempts.pop(0))
+        scanner._pending_ack["fingerprint"] = (modem, sms)
+        self.assertFalse(scanner.acknowledge("fingerprint"))
+        self.assertTrue(scanner.acknowledge("fingerprint"))
+
     def test_scanner_never_prunes_after_failed_or_malformed_listing(self):
         modem = "/org/freedesktop/ModemManager1/Modem/0"
         sim = "/org/freedesktop/ModemManager1/SIM/0"

@@ -73,6 +73,7 @@ VENV_DIR="$REPO_DIR/control/.venv"
 WEBUI_DIST="$REPO_DIR/webui/dist"
 SYSTEMD_UNIT="/etc/systemd/system/mdd-sim-gateway-control.service"
 ORCHESTRATOR_UNIT="/etc/systemd/system/mdd-sim-gateway-orchestrator.service"
+DJI_CELLULAR_RULE="/etc/udev/rules.d/99-mdd-dji-cellular.rules"
 # Where the selected deploy mode is remembered between invocations.
 MODE_STATE="$MDD_DATA_DIR/install-mode"
 
@@ -212,6 +213,27 @@ ensure_cellular_tools() {
   ensure_modemmanager_command_interface
 }
 
+# The first-generation DJI Cellular Dongle is an EG25/EC25-class modem shipped as 2ca3:4006.
+# The standard option driver supports the hardware but does not carry DJI's private VID/PID.
+# Install an auditable udev rule that adds the ID dynamically; this also works after usbipd-win
+# attaches the composite USB device to WSL2. No persistent modem NVRAM setting is changed.
+ensure_dji_cellular_rule() {
+  source_rule="$REPO_DIR/host/99-mdd-dji-cellular.rules"
+  [ -f "$source_rule" ] || die "missing DJI cellular udev rule: $source_rule"
+  install -d -m 0755 /etc/udev/rules.d
+  if [ ! -f "$DJI_CELLULAR_RULE" ] || ! cmp -s "$source_rule" "$DJI_CELLULAR_RULE"; then
+    install -m 0644 "$source_rule" "$DJI_CELLULAR_RULE"
+    if have udevadm; then
+      udevadm control --reload-rules
+      udevadm trigger --action=add --subsystem-match=usb >/dev/null 2>&1 || true
+      udevadm settle >/dev/null 2>&1 || true
+    fi
+    info "installed first-generation DJI Cellular USB binding rule (2ca3:4006)"
+  else
+    info "first-generation DJI Cellular USB binding rule already installed"
+  fi
+}
+
 # The module SIM bridge sends APDUs through ModemManager's guarded AT command API.  Upstream
 # exposes that API only when started with --debug; immediately lower its runtime logging back to
 # INFO so this does not produce debug-volume logs.  The drop-in is MDD-owned and installed only
@@ -223,12 +245,25 @@ ensure_modemmanager_command_interface() {
   dropin_dir=/etc/systemd/system/ModemManager.service.d
   dropin_file=$dropin_dir/90-mdd-command-interface.conf
   temporary=$(mktemp /tmp/mdd-modemmanager.XXXXXX)
-  cat >"$temporary" <<EOF
+  {
+    # Ubuntu's packaged unit refuses to start when systemd classifies the host as a
+    # container. WSL2 reports exactly that while still providing real forwarded USB
+    # devices, so clear only this unit condition there. Keep the distro safeguard on
+    # Docker/LXC and ordinary Linux hosts.
+    if [ "$(systemd-detect-virt 2>/dev/null || true)" = "wsl" ]; then
+      cat <<'EOF'
+[Unit]
+ConditionVirtualization=
+
+EOF
+    fi
+    cat <<EOF
 [Service]
 ExecStart=
 ExecStart=$modemmanager_bin --debug
 ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1 org.freedesktop.ModemManager1 SetLogging s INFO
 EOF
+  } >"$temporary"
   if [ ! -f "$dropin_file" ] || ! cmp -s "$temporary" "$dropin_file"; then
     install -d -m 0755 "$dropin_dir"
     install -m 0644 "$temporary" "$dropin_file"
@@ -919,6 +954,10 @@ run_orchestrator() {
   # Debian/Ubuntu/Armbian package name. Other distributions can provide libifdvpcd.so manually;
   # native PC/SC readers continue to work when it is absent.
   if [ ! -e /usr/local/lib/libifdvpcd.so ] && [ ! -e /usr/lib/libifdvpcd.so ] && have apt-get; then
+    # A previous partial/source install can leave the package held before dpkg has installed it.
+    # Temporarily unhold it so apt can provide the bootstrap two-slot driver; ensure_vpcd_host
+    # rebuilds the required slot count and applies the hold again after the custom install.
+    if have apt-mark; then apt-mark unhold vsmartcard-vpcd >/dev/null 2>&1 || true; fi
     pkg_install vsmartcard-vpcd
   fi
   VPCD_LIB=$(find /usr/local/lib /usr/lib -name libifdvpcd.so -print -quit 2>/dev/null || true)
@@ -1018,6 +1057,7 @@ cmd_install() {
   ensure_singbox
   ensure_xray
   ensure_cellular_tools
+  ensure_dji_cellular_rule
   if [ ! -x "$MDD_DATA_DIR/lpac/lpac" ]; then
     saved_args=$ARGS; ARGS=""; cmd_build_lpac; ARGS=$saved_args
   else
@@ -1075,6 +1115,7 @@ cmd_reload() {
   ensure_singbox
   ensure_xray
   ensure_cellular_tools
+  ensure_dji_cellular_rule
   if [ "$PRESERVE_ENGINES" = 1 ]; then
     docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || \
       die "--no-engines requires the existing engine image $ENGINE_IMAGE"
@@ -1188,6 +1229,10 @@ cmd_uninstall() {
     rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl try-restart ModemManager.service >/dev/null 2>&1 || true
+  fi
+  if [ -f "$DJI_CELLULAR_RULE" ] && cmp -s "$REPO_DIR/host/99-mdd-dji-cellular.rules" "$DJI_CELLULAR_RULE"; then
+    rm -f "$DJI_CELLULAR_RULE"
+    udevadm control --reload-rules >/dev/null 2>&1 || true
   fi
   info "removing MDD containers…"
   if managed_control_exists; then docker rm -f "$CONTROL_NAME" >/dev/null; fi

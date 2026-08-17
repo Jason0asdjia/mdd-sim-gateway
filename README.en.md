@@ -28,6 +28,10 @@ MDD Sim Gateway is a self-hosted multi-SIM communications gateway for Debian, Ub
 
 Use an ARM64 Debian, Ubuntu or Armbian host with systemd, Docker, USB and a stable network connection.
 
+Windows 11 can use a hybrid WSL2 + usbipd-win deployment. See the
+[Windows 11 + WSL2 guide](docs/WSL2.md) for USB forwarding, same-distribution Docker and
+always-on limitations.
+
 ```bash
 git clone https://github.com/MddIdd/mdd-sim-gateway.git
 cd mdd-sim-gateway
@@ -76,7 +80,7 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 | Hardware | 4G data | Wi-Fi Calling | SIM access |
 |---|---:|---:|---|
 | ModemManager-compatible cellular module | Yes | Yes | Modem APDU/logical-channel bridge |
-| DJI/Quectel EC25-class module | Yes | Yes | Automatically provisioned virtual slots |
+| DJI/Quectel EC25-class module (including first-gen factory ID `2ca3:4006`) | Yes* | Yes | Automatically provisioned virtual slots |
 | USB PC/SC reader | No | Yes | Direct PC/SC |
 | Santi Electronics SCR Prime (`04d9:c001`) | No | Yes | Direct PC/SC; install with the `patchprime` driver patch |
 | eUICC/eSIM reader | No | Yes | PC/SC and lpac |
@@ -84,6 +88,10 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 The Santi Electronics SCR Prime has been verified on physical hardware. Support in this table
 describes the implemented path; it does not guarantee that every SIM, firmware build or carrier
 will permit the service.
+
+\* The first-generation `2ca3:4006` path installs a serial-binding rule automatically. Full
+4G/QMI still depends on kernel support, the module's USB interface layout and ModemManager
+successfully creating a modem object.
 
 ## What the installer does
 

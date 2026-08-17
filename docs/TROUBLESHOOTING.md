@@ -6,6 +6,11 @@
 - 能振铃但没声音：确认 `MDD_ADVERTISE_ADDR` 是软电话可达的主机地址，并检查 RTP 端口与浏览器麦克风权限。
 - 读卡器未出现：先用 `lsusb` 确认 USB 层，再运行 `pcsc_scan` 检查 PC/SC 层。SCR Prime（`04d9:c001`）需执行一次 `sudo ./install.sh patchprime` 加入 libccid 设备表；之后支持热插拔。读卡器没有 4G 开关属于正常设计。
 - SIM 逻辑通道分配失败：查看“设备 → 硬件”中的已分配数量、通道用途和明确错误。系统会自动释放本轮部分分配；若持续失败，先重启对应线路，确认仍失败后再安排模块复位，不要只按底层 QMI 错误码猜测原因。
+- WSL2 中 `lsusb` 有 `2ca3:4006` 但没有 `/dev/ttyUSB*`：先执行
+  `sudo ./install.sh reload` 安装/刷新项目 udev 规则，再检查 `dmesg | tail -100`。
+  不要为了得到标准 USB ID 盲目写入模块 NVRAM。
+- WSL2 中切换 eSIM 配置文件后设备离线：复位会让 USB 短暂重新枚举；确认 Windows
+  中的 `usbipd attach --auto-attach` 仍在运行，并用 `usbipd list` 确认设备重新处于 Attached。
 - Telegram 失败：选择手动 HTTP/SOCKS 代理或已就绪的国家出口，并使用“测试”。
 - Telegram 机器人不响应指令：先确认“通知 → Telegram → 聊天指令”已开启，且发送者的数字 ID
   在授权列表里（向 `@userinfobot` 索取自己的 ID；群聊需填群 ID，且群 ID 为负数）。指令走与推送

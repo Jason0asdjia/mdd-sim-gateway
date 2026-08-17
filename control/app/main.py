@@ -40,7 +40,7 @@ STATUS_OK_GRACE_SECONDS = 20
 STATUS_POLL_FAST_SECONDS = 4.0
 STATUS_POLL_HEALTHY_SECONDS = 15.0
 ESIM_BRIDGE_RESTART_TIMEOUT = float(
-    os.environ.get("MDD_ESIM_BRIDGE_RESTART_TIMEOUT", "50"))
+    os.environ.get("MDD_ESIM_BRIDGE_RESTART_TIMEOUT", "110"))
 ESIM_CARD_REFRESH_ATTEMPTS = int(
     os.environ.get("MDD_ESIM_CARD_REFRESH_ATTEMPTS", "12"))
 ESIM_CARD_REFRESH_INTERVAL = float(
@@ -1600,6 +1600,14 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
                                      pinned, candidates, peer_registered=peer_registered)
     hub.exit_ledgers[iid] = ledger
     _save_exit_ledgers()
+    if (verdict == failover.BLAMES_EXIT
+            and int(ledger.get("strikes") or 0) >= failover.STRIKES_PER_NODE):
+        try:
+            egress.record_vowifi_failure(
+                inst, node, str(st.get("reason_code") or "tunnel_network"),
+                int(ledger.get("strikes") or 0), action)
+        except Exception as exc:  # noqa
+            log.warning("could not publish VoWiFi node failure for line %s: %s", iid, exc)
     log.info("line %s froze (%s) after %.0fs healthy; tunnel=%s ike_retransmits=%d "
              "-> blames %s, action %s (node=%s strikes=%d tried=%d/%d peer=%s)",
              iid, st.get("reason_code"), stable_for, swu or "unknown", retransmits,
@@ -1656,13 +1664,22 @@ async def cellular_sms_poller():
                     store.add_imported_message, item["fingerprint"], item["instance"],
                     item["direction"], item["peer"], item["body"], item["ts"],
                     item["transport"])
-                if not rec:
-                    continue
-                await hub.broadcast({"type": "sms", "instance": rec["instance"],
-                                     "message": rec})
-                if rec["direction"] == "in":
-                    _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
-                                   rec["peer"], rec["body"])
+                if rec:
+                    try:
+                        await hub.broadcast({"type": "sms", "instance": rec["instance"],
+                                             "message": rec})
+                    except Exception as exc:  # noqa - persistence remains authoritative
+                        log.debug("cellular SMS broadcast failed: %r", exc)
+                    if rec["direction"] == "in":
+                        # Scheduling notification delivery happens before modem acknowledgement.
+                        # The SQLite row remains the durable source even if a channel later fails.
+                        _dispatch_push(notify_push.EV_INCOMING_SMS, rec["instance"],
+                                       rec["peer"], rec["body"])
+                # ``rec is None`` means this fingerprint was already committed on an earlier
+                # cycle. It is therefore also safe to retry a previously-failed modem cleanup.
+                removed = await asyncio.to_thread(scanner.acknowledge, item["fingerprint"])
+                if not removed:
+                    log.debug("cellular SMS persisted but modem cleanup will be retried")
         except Exception as exc:  # noqa
             log.debug("cellular SMS poll failed: %r", exc)
         await asyncio.sleep(5)
@@ -1896,6 +1913,10 @@ def apply_health(iid, inst, st, container_id: str | None = None):
         # still stands. Clearing here is also what lets a reported line report again later.
         if hub.exit_ledgers.pop(str(iid), None) is not None:
             _save_exit_ledgers()
+        try:
+            egress.clear_vowifi_failure(inst)
+        except Exception as exc:  # noqa - healthy line state remains authoritative
+            log.warning("could not clear recovered VoWiFi exit failure for line %s: %s", iid, exc)
         hub.reset_health(iid)
         st["retry"] = {"count": 0, "max": rmax}
         return st
@@ -2534,6 +2555,7 @@ def _esim_write_bridge_restart_request(hardware_id: str, iccid: str) -> tuple[st
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump({"request_id": request_id, "device_id": hardware_id,
                    "expected_iccid_sha256": hashlib.sha256(iccid.encode()).hexdigest(),
+                   "reset_modem": True,
                    "requested_at": time.time()}, handle)
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
@@ -3796,7 +3818,8 @@ async def _test_egress_country(country: str):
             except egress.EgressError as exc:
                 raise HTTPException(503, str(exc)) from exc
             return {"ok": True, "country": country, "node": latest.get("node") or "",
-                    "interface": latest.get("interface") or "", "latency_ms": latency}
+                    "interface": latest.get("interface") or "", "latency_ms": latency,
+                    "validation": "basic_udp_dns", "vowifi_ports_verified": False}
         if latest.get("error"):
             break
         await asyncio.sleep(.5)
@@ -3815,7 +3838,8 @@ async def api_egress_profile_test(profile_id: str, body: dict | None = None):
         latency = await asyncio.to_thread(egress.test_proxy_profile, profile)
     except egress.EgressError as exc:
         raise HTTPException(503, str(exc)) from exc
-    return {"ok": True, "profile_id": profile_id, "latency_ms": latency}
+    return {"ok": True, "profile_id": profile_id, "latency_ms": latency,
+            "validation": "basic_udp_dns", "vowifi_ports_verified": False}
 
 
 @app.post("/api/egress/{country}/test")
@@ -4561,6 +4585,11 @@ async def _send_sms_cellular(iid: str, to: str, text: str) -> dict:
     store.set_message_status(rec["id"], message_status, error)
     rec["status"], rec["error"] = message_status, error
     await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
+    if result.get("ok") and result.get("modem_path") and result.get("sms_path"):
+        # The sent row is now durable, so the ModemManager submit object no longer needs one of
+        # the modem's limited storage slots. Failure is harmless and may be retried manually.
+        await asyncio.to_thread(
+            cellular_sms.delete_modem_sms, result["modem_path"], result["sms_path"])
     return {**result, "message": rec, "transport": "cellular"}
 
 
@@ -5176,8 +5205,12 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
                 name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")),
                 keep_busy=True)
             lpa_succeeded = True
-            await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
             recovery = await _esim_recover_profile_switch(name, hardware_id, iccid)
+            # The lpac command only proves that the eUICC accepted the request. Publish the
+            # new state after the modem reset and every VPCD slot independently report the
+            # requested Profile; otherwise the WebUI would claim a switch that the baseband
+            # is still caching from the previous Profile.
+            await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
             return {"ok": True, "iccid": iccid, "se_id": se["id"],
                     "card": recovery["card"], "recovery": {
                         "instance_id": recovery["instance_id"],

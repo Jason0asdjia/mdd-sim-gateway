@@ -1,0 +1,5 @@
+# DJI Cellular Dongle (first generation) exposes its EG25/EC25-class serial functions under
+# DJI's factory USB ID. Linux's option driver does not contain this ID, so register it when the
+# device appears. Writing new_id asks the driver core to bind the already-enumerated interfaces;
+# a repeated add is harmless and is intentionally ignored.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2ca3", ATTR{idProduct}=="4006", RUN+="/bin/sh -c '/sbin/modprobe option; echo 2ca3 4006 > /sys/bus/usb-serial/drivers/option1/new_id 2>/dev/null || true'"

@@ -53,6 +53,8 @@ VPCD_DRIVER_DIRS = ("/usr/lib", "/usr/local/lib")
 # would exit at startup and be respawned every cycle. The installer deliberately builds the
 # driver with a spare slot, so this is the binding limit rather than the driver's.
 VPCD_CHANNEL_CAPACITY = 3
+PROFILE_RESET_SETTLE_SECONDS = 5
+PROFILE_RESTART_TIMEOUT = 90
 # The reader definition shipped by the vsmartcard-vpcd package, renamed out of the way
 # (pcsc-lite skips dot files) rather than deleted, so an operator can restore it.
 DISTRO_VPCD_READER = "vpcd"
@@ -216,6 +218,60 @@ def parse_share_link(url: str) -> dict:
         node["ws-opts"] = {"path": unquote(query.get("path") or "/"),
                            "headers": {"Host": host} if host else {}}
     return node
+
+
+def normalize_subscription(value) -> dict:
+    """Normalize Clash YAML and Base64 share-link subscriptions.
+
+    Many Shadowsocks providers still return the original SIP008-style payload: one Base64
+    string which decodes to newline-separated ``ss://`` links. Treating that scalar as a
+    Clash document used to fail later with ``'str' object has no attribute 'get'``. Normalize
+    both formats here so country filtering and UDP admission always receive node dictionaries.
+    """
+    document = dict(value) if isinstance(value, dict) else {}
+    raw_nodes = value.get("proxies") if isinstance(value, dict) else value
+    if isinstance(raw_nodes, str):
+        text = raw_nodes.strip()
+        decoded = ""
+        try:
+            decoded = b64_padded("".join(text.split()))
+        except (ValueError, UnicodeError, base64.binascii.Error):
+            pass
+        # Only prefer decoded text when it resembles a share-link feed. This prevents an
+        # arbitrary YAML scalar from being accepted merely because Base64 is lenient.
+        if "://" in decoded:
+            text = decoded
+        raw_nodes = [line.strip() for line in text.splitlines() if line.strip()]
+    if not isinstance(raw_nodes, list):
+        raise ValueError("subscription must be Clash YAML or a Base64 share-link list")
+
+    nodes = []
+    errors = []
+    for index, item in enumerate(raw_nodes[:2048]):
+        if isinstance(item, dict):
+            nodes.append(dict(item))
+            continue
+        link = str(item or "").strip()
+        if not link or "://" not in link:
+            continue
+        try:
+            node = parse_share_link(link)
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            errors.append(str(exc))
+            continue
+        fragment = ""
+        try:
+            fragment = urllib.parse.unquote(urllib.parse.urlsplit(link).fragment or "")
+        except ValueError:
+            pass
+        node["name"] = str(node.get("name") or fragment
+                           or f"{node.get('type') or 'node'}-{index + 1}")[:240]
+        nodes.append(node)
+    if not nodes:
+        detail = f": {errors[0]}" if errors else ""
+        raise ValueError("subscription contains no supported proxy nodes" + detail)
+    document["proxies"] = nodes
+    return document
 
 
 def parse_manual_outbound(value, tag: str) -> dict:
@@ -555,6 +611,26 @@ class Orchestrator:
         self._bridge_restarts[request_id] = value
         return value
 
+    @staticmethod
+    def _reset_modem_for_profile_switch(mm_object: str) -> tuple[bool, str]:
+        """Reset through ModemManager, with a serialized AT fallback for DJI modules.
+
+        Some generic AT ModemManager plugins expose ``Modem.Reset`` but return Core.Unsupported
+        for this hardware. The command interface is enabled by the installer specifically so
+        the bridge can serialize AT access through ModemManager; using it here avoids opening
+        the physical tty behind ModemManager's back.
+        """
+        reset = run(["mmcli", "-m", mm_object, "--reset"])
+        if reset.returncode == 0:
+            return True, "modemmanager-reset"
+        error = (reset.stderr or reset.stdout or "unknown error").strip()
+        if "Unsupported" not in error and "not supported" not in error.lower():
+            return False, error
+        fallback = run(["mmcli", "-m", mm_object, "--command=AT+CFUN=1,1"])
+        if fallback.returncode == 0:
+            return True, "at-cfun-reset"
+        return False, (fallback.stderr or fallback.stdout or "unknown error").strip()
+
     def process_bridge_restart_requests(self):
         """Consume scoped requests and stop only the selected modem bridge.
 
@@ -573,6 +649,7 @@ class Orchestrator:
             request_id = str(request.get("request_id") or "")
             device_id = str(request.get("device_id") or "")
             expected_iccid_sha256 = str(request.get("expected_iccid_sha256") or "")
+            reset_modem = request.get("reset_modem") is True
             if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", request_id)
                     or request_id != path.stem
                     or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", device_id)
@@ -590,6 +667,7 @@ class Orchestrator:
                 "request_id": request_id,
                 "device_id": device_id,
                 "expected_iccid_sha256": expected_iccid_sha256,
+                "reset_modem": reset_modem,
                 "requested_at": requested_at,
                 "started_at": time.time(),
             }
@@ -608,8 +686,49 @@ class Orchestrator:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-            self._bridge_restart_status(request, "stopped")
-            self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
+            if reset_modem:
+                command = self._bridge_commands.get(device_id) or []
+                mm_object = ""
+                if "--modemmanager" in command:
+                    position = command.index("--modemmanager") + 1
+                    if position < len(command):
+                        mm_object = str(command[position])
+                if not mm_object:
+                    assignment = ((read_json(self.hw_state_path).get("assignments") or {})
+                                  .get(device_id) or {})
+                    mm_object = self.modemmanager_modem_for_tty(
+                        str(assignment.get("tty") or ""))
+                if not mm_object:
+                    self._bridge_restart_status(
+                        request, "failed",
+                        error="cannot reset the modem: ModemManager does not own this device")
+                    continue
+                reset_ok, reset_method = self._reset_modem_for_profile_switch(mm_object)
+                if not reset_ok:
+                    self._bridge_restart_status(
+                        request, "failed", error="ModemManager could not reset the modem: "
+                        + reset_method)
+                    continue
+                self._bridge_restart_status(
+                    request, "resetting", reset_started_at=time.time(),
+                    reset_method=reset_method)
+                self.log(f"reset modem after eUICC profile switch: {device_id}")
+            else:
+                self._bridge_restart_status(request, "stopped")
+                self.log(f"stopped VPCD bridge for eUICC profile refresh: {device_id}")
+
+    def _profile_reset_suppresses_bridge(self, device_id: str) -> bool:
+        """Hold the bridge until a requested modem reset has settled or re-enumerated."""
+        now = time.time()
+        for request in self._bridge_restarts.values():
+            if (str(request.get("device_id") or "") != device_id
+                    or request.get("state") != "resetting"):
+                continue
+            if request.get("disappeared_at"):
+                return True
+            return now - float(request.get("reset_started_at") or now) < \
+                PROFILE_RESET_SETTLE_SECONDS
+        return False
 
     def finish_bridge_restart_requests(self, present_ids: set[str]):
         """Advance stopped requests only when the replacement bridge is authoritative."""
@@ -620,14 +739,33 @@ class Orchestrator:
                 self._bridge_restarts.pop(request_id, None)
                 continue
             device_id = str(request.get("device_id") or "")
+            if now - float(request.get("started_at") or now) > PROFILE_RESTART_TIMEOUT:
+                mismatch = bool(request.get("observed_profile_mismatch"))
+                disappeared = bool(request.get("disappeared_at"))
+                self._bridge_restart_status(
+                    request, "failed", error=(
+                        "modem reset completed, but the requested eSIM Profile did not become active"
+                        if mismatch else
+                        "modem reset detached the USB device from WSL and it did not return; "
+                        "enable usbipd auto-attach for this device"
+                        if disappeared else
+                        "timed out resetting the modem and rebuilding the VPCD bridge"))
+                continue
             if device_id not in present_ids:
-                self._bridge_restart_status(
-                    request, "failed", error="modem disappeared during bridge rebuild")
+                if request.get("state") == "resetting":
+                    if not request.get("disappeared_at"):
+                        self._bridge_restart_status(request, "resetting", disappeared_at=now)
+                    continue
+                self._bridge_restart_status(request, "failed",
+                                            error="modem disappeared during bridge rebuild")
                 continue
-            if now - float(request.get("started_at") or now) > 45:
-                self._bridge_restart_status(
-                    request, "failed", error="timed out rebuilding the VPCD bridge")
-                continue
+            if state == "resetting":
+                reset_started = float(request.get("reset_started_at") or now)
+                if (not request.get("disappeared_at")
+                        and now - reset_started < PROFILE_RESET_SETTLE_SECONDS):
+                    continue
+                request = self._bridge_restart_status(request, "reset_complete")
+                state = "reset_complete"
             proc = self.bridges.get(device_id)
             if not proc or proc.poll() is not None:
                 continue
@@ -644,6 +782,10 @@ class Orchestrator:
             expected = str(request.get("expected_iccid_sha256") or "")
             actual = str(identity.get("iccid") or "")
             if expected and hashlib.sha256(actual.encode()).hexdigest() != expected:
+                if not request.get("observed_profile_mismatch"):
+                    self._bridge_restart_status(
+                        request, "spawned", observed_profile_mismatch=True,
+                        bridge_pid=int(proc.pid))
                 continue
             self._bridge_restart_status(
                 request, "channels_ready", bridge_pid=int(proc.pid),
@@ -1290,6 +1432,11 @@ class Orchestrator:
 
     @staticmethod
     def _active_gsm_profiles() -> list[tuple[str, str]]:
+        # Native WSL2 card/SMS mode deliberately runs without NetworkManager so it cannot
+        # take over the distribution network. With no nmcli there are no NM-owned GSM
+        # connections to disconnect.
+        if not shutil.which("nmcli"):
+            return []
         result = run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
         profiles = []
         if result.returncode == 0:
@@ -1301,6 +1448,9 @@ class Orchestrator:
 
     def ensure_modem_data(self, modem: dict, snapshot: dict) -> None:
         """Give each modem its own NetworkManager GSM profile and bearer."""
+        if not shutil.which("nmcli"):
+            self.log("cellular data requested but NetworkManager is unavailable")
+            return
         if not snapshot.get("powered") or snapshot.get("data_active"):
             return
         registration = snapshot.get("registration")
@@ -1620,7 +1770,7 @@ class Orchestrator:
                     raise
         if yaml is None:
             raise RuntimeError("PyYAML is required for subscription mode")
-        return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
+        return normalize_subscription(yaml.safe_load(cache.read_text(encoding="utf-8")) or {})
 
     def xhttp_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
         """Register one loopback-only Xray XHTTP endpoint and return its sing-box detour."""
@@ -2545,6 +2695,8 @@ class Orchestrator:
         unclaimed = []
         for modem in modems:
             if modem["id"] in self.bridges: continue
+            if self._profile_reset_suppresses_bridge(modem["id"]):
+                continue
             if not self._bridge_retry_due(modem["id"]):
                 continue
             bridge = self.repo / "host" / "vpcd_modem_bridge.py"
