@@ -20,15 +20,23 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   Docker, usbipd-win attachment/auto-reattachment and always-on limitations.
 - Added built-in discovery and an installer-managed serial binding rule for the first-generation
   DJI Cellular Dongle factory USB ID `2ca3:4006`, without rewriting modem NVRAM.
+- Added portable Windows launchers that derive the WSL project path, maintain usbipd auto-attach
+  for every supported modem and verify the gateway services.
+- Added administrator-managed WireGuard interfaces as isolated country exits. Imports reject
+  wg-quick command hooks, use private configuration permissions and never replace the host route.
 
 ### Changed
 
 - eSIM profile switching now resets only the selected modem through ModemManager (with a
   serialized `AT+CFUN=1,1` fallback), tolerates USB re-enumeration and waits for the requested
   ICCID to appear before publishing success. WSL2 reports a specific auto-attach recovery error.
+- Flight mode keeps ModemManager available for command and SMS access while VoWiFi is active,
+  but repeated SIM channel failures still degrade safely to the direct-serial bridge.
 - Proxy tests are now described as basic UDP/DNS checks; actual VoWiFi IKE compatibility is
   reported separately and recovered status clears stale failure evidence.
 - Clash YAML and Base64 share-link subscriptions are normalized before country-node selection.
+- WireGuard country exits now receive deterministic per-country packet marks, policy tables and
+  rule priorities, so multiple interfaces cannot overwrite one another.
 
 ### Fixed
 

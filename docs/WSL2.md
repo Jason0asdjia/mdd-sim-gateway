@@ -89,6 +89,30 @@ Ubuntu 的 ModemManager 服务默认拒绝在被识别为容器的环境中启�
 通常自动可用；如果要让局域网其他设备访问，需另外配置 Windows 防火墙与端口转发，并把
 `MDD_ADVERTISE_ADDR` 设置成这些客户端能访问的地址。
 
+## Windows 一键启动
+
+完成一次安装和 `usbipd bind` 后，可从 Windows 资源管理器打开项目的 `scripts` 目录，双击
+`Start-MDD-Gateway.cmd`。脚本会从自身 UNC 路径自动推导 WSL 项目位置，启动
+`Ubuntu-24.04`、为所有可见的 `2ca3:4006`/`2c7c:0125` 模块维持自动附加，并以 root
+执行 `start-mdd-wsl.sh` 检查服务。仓库移动后无需修改脚本。
+
+发行版名称不是 `Ubuntu-24.04` 时，从 PowerShell 显式执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-mdd.ps1 -Distro Ubuntu
+```
+
+首次发现模块为 `Not shared` 时，脚本会显示对应 BUSID；仍需在管理员 PowerShell 运行一次
+`usbipd bind --busid <BUSID>`。之后的附加与复位重连不需要管理员权限。
+
+## WireGuard 国家出口
+
+代理库可以导入标准 WireGuard `.conf`，或引用已启动的系统接口。导入时拒绝任何
+`PreUp`/`PostUp`/`PreDown`/`PostDown` 命令，并强制写入 `Table=off`，防止 VPN 替换整个
+WSL 的默认路由。每个国家出口使用不同的 packet mark、路由表和规则优先级，多条
+WireGuard 出口不会互相覆盖。是否能承载 VoWiFi 仍应在分配国家出口后用国家出口的 UDP
+测试和实际线路注册确认。
+
 ## 限制与排查
 
 - WSL2 只有在发行版启动时才运行这些服务。要做常开网关，登录任务应先启动 WSL，再启动

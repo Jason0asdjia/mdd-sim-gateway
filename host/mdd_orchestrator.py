@@ -61,6 +61,11 @@ DISTRO_VPCD_READER = "vpcd"
 DISTRO_VPCD_READER_DISABLED = ".vpcd.mdd-disabled"
 MANAGED_ROUTE_PROTO = "186"
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
+# Only marked country-exit packets use these policy tables; normal WSL traffic stays on eth0.
+# A stable slot per ISO alpha-2 country keeps simultaneous WireGuard exits independent.
+PROJECT_WG_MARK_BASE = 0x4D0000
+PROJECT_WG_TABLE_BASE = 52000
+PROJECT_WG_RULE_PRIORITY_BASE = 11000
 
 
 def read_json(path: Path) -> dict:
@@ -106,6 +111,33 @@ def run(args, *, check=False, capture=True):
     return subprocess.run(args, check=check, text=True,
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.PIPE if capture else None)
+
+
+def project_wireguard_policy(country: str) -> tuple[int, int, int]:
+    """Return a deterministic, non-overlapping mark/table/priority for a country exit."""
+    normalized = str(country or "").lower()
+    if not re.fullmatch(r"[a-z]{2}", normalized):
+        raise ValueError("WireGuard country must be a two-letter code")
+    slot = (ord(normalized[0]) - ord("a")) * 26 + ord(normalized[1]) - ord("a")
+    return (PROJECT_WG_MARK_BASE + slot, PROJECT_WG_TABLE_BASE + slot,
+            PROJECT_WG_RULE_PRIORITY_BASE + slot)
+
+
+def ensure_project_wireguard_route(country: str, interface: str) -> int:
+    """Route only MDD-marked packets through a host WireGuard interface."""
+    mark, table, priority = project_wireguard_policy(country)
+    route = run(["ip", "-4", "route", "replace", "default", "dev", interface,
+                 "table", str(table)])
+    if route.returncode:
+        raise ValueError("could not install the private WireGuard route")
+    rules = run(["ip", "-4", "rule", "show"])
+    wanted = f"fwmark 0x{mark:x} lookup {table}"
+    if wanted not in rules.stdout.lower():
+        added = run(["ip", "-4", "rule", "add", "priority", str(priority),
+                     "fwmark", str(mark), "lookup", str(table)])
+        if added.returncode:
+            raise ValueError("could not install the private WireGuard policy rule")
+    return mark
 
 
 def slug(value: str) -> str:
@@ -427,6 +459,10 @@ def outbound_supports_udp(outbound: dict) -> bool:
         return False
     if kind == "socks":
         return str(outbound.get("version") or "5") == "5"
+    # An existing system WireGuard interface owns its own keys. This direct
+    # outbound only binds country egress packets to that interface.
+    if kind == "direct":
+        return bool(str(outbound.get("bind_interface") or "").strip())
     return kind in {"shadowsocks", "trojan", "vless", "vmess", "hysteria", "hysteria2",
                     "tuic", "wireguard"}
 
@@ -636,6 +672,26 @@ class Orchestrator:
             return True, "at-cfun-reset"
         return False, (fallback.stderr or fallback.stdout or "unknown error").strip()
 
+
+    @staticmethod
+    def _reset_modem_direct_for_profile_switch(tty: str) -> tuple[bool, str]:
+        """Reset after stopping a direct VPCD bridge when no MM object exists."""
+        if serial is None:
+            return False, "pyserial is unavailable"
+        if not tty or not Path(tty).exists():
+            return False, "modem serial port is unavailable"
+        try:
+            modem = serial.Serial(tty, 115200, timeout=.5, write_timeout=2, exclusive=True)
+            try:
+                modem.reset_input_buffer()
+                modem.write(b"AT+CFUN=1,1\r")
+                modem.flush()
+            finally:
+                modem.close()
+            return True, "direct-at-cfun-reset"
+        except Exception as exc:
+            return False, str(exc)
+
     def process_bridge_restart_requests(self):
         """Consume scoped requests and stop only the selected modem bridge.
 
@@ -698,17 +754,16 @@ class Orchestrator:
                     position = command.index("--modemmanager") + 1
                     if position < len(command):
                         mm_object = str(command[position])
+                assignment = ((read_json(self.hw_state_path).get("assignments") or {})
+                              .get(device_id) or {})
                 if not mm_object:
-                    assignment = ((read_json(self.hw_state_path).get("assignments") or {})
-                                  .get(device_id) or {})
                     mm_object = self.modemmanager_modem_for_tty(
                         str(assignment.get("tty") or ""))
-                if not mm_object:
-                    self._bridge_restart_status(
-                        request, "failed",
-                        error="cannot reset the modem: ModemManager does not own this device")
-                    continue
-                reset_ok, reset_method = self._reset_modem_for_profile_switch(mm_object)
+                if mm_object:
+                    reset_ok, reset_method = self._reset_modem_for_profile_switch(mm_object)
+                else:
+                    reset_ok, reset_method = self._reset_modem_direct_for_profile_switch(
+                        str(assignment.get("tty") or ""))
                 if not reset_ok:
                     self._bridge_restart_status(
                         request, "failed", error="ModemManager could not reset the modem: "
@@ -734,6 +789,18 @@ class Orchestrator:
             return now - float(request.get("reset_started_at") or now) < \
                 PROFILE_RESET_SETTLE_SECONDS
         return False
+
+    def _profile_reset_needs_fast_serial_fallback(self, device_id: str) -> bool:
+        """Avoid making an eSIM switch wait longer for MM than the request can live.
+
+        A module reset removes its D-Bus modem object before the USB serial ports return.
+        If ModemManager has not reclaimed the replacement by reset completion, starting the
+        VPCD bridge through the safe direct-serial fallback is preferable to failing the
+        switch while the normal 180-second claim grace is still running.
+        """
+        return any(str(request.get("device_id") or "") == device_id
+                   and str(request.get("state") or "") in {"reset_complete", "spawned"}
+                   for request in self._bridge_restarts.values())
 
     def finish_bridge_restart_requests(self, present_ids: set[str]):
         """Advance stopped requests only when the replacement bridge is authoritative."""
@@ -1328,11 +1395,11 @@ class Orchestrator:
             return False
         if plan["cellular_devices"]:
             return True
-        # With RF deliberately disabled, ModemManager has no remaining job: data is off and
-        # direct serial can continue serving the UICC/VoWiFi path. It is brought back before
-        # RF is enabled again, so the transition remains explicit and reversible.
+        # VoWiFi needs ModemManager to own the modem even while flight mode keeps RF
+        # disabled. This preserves the command/SMS path without creating a data bearer,
+        # unless MM has already failed this modem and direct serial is the only safe path.
         if present_ids and set(present_ids) <= set(plan.get("flight_mode_devices") or []):
-            return False
+            return bool(plan.get("vowifi_devices")) and not set(present_ids) <= set(self._degraded)
         if not plan["cellular_backend_required"]:
             return False
         if present_ids and set(present_ids) <= set(self._degraded):
@@ -1923,7 +1990,8 @@ class Orchestrator:
             if isinstance(profile, dict):
                 profile_type = str(profile.get("type") or "").lower()
                 mode = "subscription" if profile_type == "subscription" else "existing" \
-                    if profile_type == "existing" else "manual"
+                    if profile_type == "existing" else "interface" \
+                    if profile_type == "wireguard_interface" else "manual"
             tag = f"exit-{country}"
             if mode == "direct":
                 state[country] = {"ready": True, "mode": mode, "interface": ""}
@@ -1950,6 +2018,17 @@ class Orchestrator:
                             outbound = self.node_outbound(node, tag, profile_id or f"country-{country}")
                         else:
                             outbound = parse_manual_outbound(value, tag)
+                elif mode == "interface":
+                    interface = str((profile or {}).get("interface") or "").strip()
+                    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", interface):
+                        raise ValueError("WireGuard interface name is invalid")
+                    try:
+                        socket.if_nametoindex(interface)
+                    except OSError as exc:
+                        raise ValueError(f"WireGuard interface {interface!r} is not active") from exc
+                    mark = ensure_project_wireguard_route(country, interface)
+                    outbound = {"type": "direct", "tag": tag, "bind_interface": interface,
+                                "routing_mark": mark}
                 elif mode == "existing":
                     source_tag = str((profile or {}).get("outbound_tag")
                                      or exit_cfg.get("outbound_tag") or "").strip()
@@ -2827,6 +2906,8 @@ class Orchestrator:
                     if modem["id"] not in self._degraded:
                         why = ("ModemManager logged that it cannot create a modem for it"
                                if refused else
+                               "ModemManager did not reclaim the modem after the eSIM profile reset"
+                               if self._profile_reset_needs_fast_serial_fallback(modem["id"]) else
                                f"ModemManager has not claimed it in {int(MM_CLAIM_GRACE_SECONDS)}s")
                         self.log(f"bridging {modem['tty']} over the serial port directly "
                                  f"({why}). VoWiFi works; cellular data and flight mode do "
@@ -2962,9 +3043,10 @@ class Orchestrator:
                      self.data / "config.yaml", self.reselect_path,
                      self.bridge_restart_request_dir):
             try:
-                stamps.append(path.stat().st_mtime)
+                metadata = path.stat()
+                stamps.append((metadata.st_mtime_ns, metadata.st_size))
             except OSError:
-                stamps.append(0.0)
+                stamps.append((0, 0))
         return tuple(stamps) + self._usb_fingerprint()
 
     @staticmethod

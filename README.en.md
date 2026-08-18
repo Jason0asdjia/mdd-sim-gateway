@@ -30,7 +30,9 @@ Use an ARM64 Debian, Ubuntu or Armbian host with systemd, Docker, USB and a stab
 
 Windows 11 can use a hybrid WSL2 + usbipd-win deployment. See the
 [Windows 11 + WSL2 guide](docs/WSL2.md) for USB forwarding, same-distribution Docker and
-always-on limitations.
+always-on limitations. After installation, `scripts/Start-MDD-Gateway.cmd` provides a one-click
+Windows launcher: it starts the selected WSL distribution, keeps all supported USB modules
+attached, checks the gateway services and can open the Web console.
 
 ```bash
 git clone https://github.com/MddIdd/mdd-sim-gateway.git
@@ -68,7 +70,8 @@ When installation completes, open `https://<gateway-address>:8443` and create th
 - Perform EAP-AKA and IMS-AKA in the physical SIM/eSIM without reading or storing Ki/OP/OPc.
 - Show each modem UICC's three logical-channel allocations, roles and explicit failures.
 - Provide an authenticated browser softphone, SMS, call history and incoming-event notifications; standalone SIP clients are not accepted.
-- Maintain reusable subscriptions, individual nodes and SOCKS5 proxies, then assign one to each
+- Maintain reusable subscriptions, individual nodes, SOCKS5 proxies and project-isolated
+  WireGuard interfaces, then assign one to each
   country. sing-box owns the isolated TUNs; Xray-core carries Reality/XHTTP nodes. VoWiFi fails
   closed unless the selected exit passes a runtime UDP check.
 - Send standard/custom Webhooks, Telegram notifications and PushPlus messages.
@@ -128,12 +131,15 @@ If the project is useful to you, save it on GitHub and share a redacted hardware
 
 ## Country exits
 
-Add one or more subscriptions, individual nodes or SOCKS5 servers to the proxy library, then assign
-one to each country. Subscription exits retain name filtering and automatic/manual node selection;
-individual nodes and SOCKS5 entries are used directly. Reality/XHTTP share links use a loopback-only
-Xray-core bridge. The eye control is off by default, masking subscription URLs, node links and
-SOCKS5 details. A separate UDP probe is mandatory because IKEv2/ESP NAT traversal depends on UDP
-500/4500. Only that SIM's ePDG routes enter the country's dedicated TUN.
+Add one or more subscriptions, individual nodes, SOCKS5 servers or WireGuard interfaces to the
+proxy library, then assign one to each country. Imported WireGuard configurations reject command
+hooks and force `Table=off`; MDD installs a distinct packet mark and policy table per country, so
+neither normal WSL traffic nor another country's exit is redirected. Subscription exits retain name
+filtering and automatic/manual node selection; individual nodes and SOCKS5 entries are used directly.
+Reality/XHTTP share links use a loopback-only Xray-core bridge. The eye control is off by default,
+masking subscription URLs, node links and SOCKS5 details. A separate UDP probe is mandatory because
+IKEv2/ESP NAT traversal depends on UDP 500/4500. Only that SIM's ePDG routes enter the country's
+dedicated TUN or WireGuard policy table.
 
 ## Security and privacy
 

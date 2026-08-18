@@ -9,11 +9,33 @@ from unittest.mock import Mock, patch
 
 from control.app import egress
 from host.mdd_orchestrator import (Orchestrator, clash_outbound, normalize_subscription,
-                                   parse_manual_outbound,
+                                   parse_manual_outbound, project_wireguard_policy,
                                    parse_proxy_url, parse_share_link, xray_xhttp_outbound)
 
 
 class CountryEgressTests(unittest.TestCase):
+    def test_wireguard_country_policies_do_not_overlap(self):
+        gb = project_wireguard_policy("gb")
+        us = project_wireguard_policy("us")
+        self.assertEqual(len(set(gb)), 3)
+        self.assertTrue(all(left != right for left, right in zip(gb, us)))
+
+    def test_wireguard_profile_uses_its_country_mark(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch("host.mdd_orchestrator.socket.if_nametoindex", return_value=7), \
+                patch("host.mdd_orchestrator.ensure_project_wireguard_route",
+                      return_value=0x4D00AA) as ensure:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            config, states = app.build_proxy_config({
+                "profiles": {"wg-uk": {"type": "wireguard_interface", "interface": "vpnuk"}},
+                "exits": {"gb": {"enabled": True, "profile_id": "wg-uk"}},
+            })
+        outbound = next(item for item in config["outbounds"] if item["tag"] == "exit-gb")
+        self.assertEqual(outbound["routing_mark"], 0x4D00AA)
+        self.assertEqual(outbound["bind_interface"], "vpnuk")
+        self.assertTrue(states["gb"]["ready"])
+        ensure.assert_called_once_with("gb", "vpnuk")
+
     def test_successful_vowifi_registration_clears_stale_exit_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -30,6 +30,13 @@ sudo ./install.sh install --mode docker   # 控制面也运行在 Docker
 
 WSL2 中不要让 `docker` 指向 Docker Desktop 的远程 daemon。安装器只在检测到 WSL 时
 清除 Ubuntu ModemManager 单元的容器启动条件，不改变普通 Linux、Docker 或 LXC 的默认保护。
+安装完成后可双击 `scripts/Start-MDD-Gateway.cmd` 启动 WSL、维持所有受支持模块的
+usbipd 自动附加并检查网关服务；脚本会从自身位置推导项目目录。详见
+[Windows 11 + WSL2](WSL2.md#windows-一键启动)。
+
+代理库导入 WireGuard 配置时，控制服务必须以原生 root 模式运行。配置会以 `0600` 写入
+`/etc/wireguard`，命令型 wg-quick hooks 会被拒绝，并强制 `Table=off`；MDD 只为分配到
+国家出口的流量建立独立策略路由，不改动主机默认出口。
 
 版本检查始终使用 GitHub Release API，不读取或发送 GitHub Token。配置的仓库不可访问或尚未发布 Release 时，界面会显示尚无可用发布版本。
 

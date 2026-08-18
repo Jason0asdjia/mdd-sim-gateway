@@ -850,14 +850,14 @@ modem.3gpp.registration-state : unknown
             self.assertEqual(document["shared"]["cellular_backend"],
                              "disabled-by-configuration")
 
-    def test_flight_mode_only_uses_direct_serial_without_modemmanager(self):
+    def test_flight_mode_keeps_modemmanager_for_command_and_sms_access(self):
         with tempfile.TemporaryDirectory() as temp:
             app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
             flight_only = Orchestrator.capability_plan({
                 "a": {"cellular_enabled": False, "flight_mode": True,
                       "vowifi_enabled": True},
             })
-            self.assertFalse(app.cellular_backend_needed(flight_only, {"a"}, {}))
+            self.assertTrue(app.cellular_backend_needed(flight_only, {"a"}, {}))
 
             with_cellular = Orchestrator.capability_plan({
                 "a": {"cellular_enabled": True, "flight_mode": True,

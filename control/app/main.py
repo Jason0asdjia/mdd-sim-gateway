@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
-               sysinfo, failover, carrier_id, allowance, cellular_call)
+               sysinfo, failover, carrier_id, allowance, cellular_call, wireguard)
 from .version import VERSION
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
@@ -3753,6 +3753,16 @@ async def api_device_capabilities(device_id: str, body: dict):
         return response
 
 
+# ----------------------------- WireGuard import -----------------------------
+
+@app.post("/api/wireguard/interfaces")
+async def api_wireguard_import(body: dict):
+    try:
+        return await asyncio.to_thread(wireguard.import_config, body.get("interface"), body.get("config"))
+    except wireguard.WireGuardError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 # ----------------------------- settings -----------------------------
 
 
@@ -3775,7 +3785,7 @@ def api_put_settings(body: dict):
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(profile_id)) \
                     or not isinstance(profile, dict):
                 raise HTTPException(400, "invalid proxy profile id")
-            if str(profile.get("type") or "") not in {"subscription", "node", "socks5", "existing"}:
+            if str(profile.get("type") or "") not in {"subscription", "node", "socks5", "existing", "wireguard_interface"}:
                 raise HTTPException(400, "invalid proxy profile type")
             if not str(profile.get("name") or "").strip():
                 raise HTTPException(400, "proxy profile name is required")

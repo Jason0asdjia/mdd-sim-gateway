@@ -39,6 +39,33 @@ sudo ./install.sh install
 
 安装完成后访问 `https://<网关地址>:8443`，并在受信的局域网或 VPN 中立即创建管理员账号。完整的前置检查、安装过程和升级方式见 [安装与升级](docs/INSTALL.md)。
 
+## 一键启动（Windows + WSL2）
+
+推荐直接双击 `scripts\Start-MDD-Gateway.vbs`：它会自动启动、检查服务与模块，并在成功后打开浏览器，不会显示 CMD 的 UNC 路径提示。`Start-MDD-Gateway.cmd` 保留为兼容备用。
+
+也可以在 Windows PowerShell 中进入项目目录后运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-mdd.ps1
+```
+
+脚本会启动 WSL、维持 DJI 模块的 usbipd 自动附加、启动 `pcscd` 和网关服务，并检查模块串口、SIM 桥接和 Web 控制台。每一条检测均按“中文说明 | English original diagnostic”同一行显示，便于快速查看与排错。未开启 4G 时显示直连串口桥接为正常状态；需要蜂窝功能时才由项目启动 ModemManager。正常情况下最后可在 `https://localhost:8443` 打开页面。
+
+若只需在 WSL 内启动或重新检查服务，运行：
+
+```bash
+cd ~/mdd-sim-gateway
+sudo ./scripts/start-mdd-wsl.sh
+```
+
+首次使用时，如果 Windows 提示模块为 `Not shared`，请以管理员身份打开 PowerShell，并按脚本显示的 BUSID 执行一次：
+
+```powershell
+usbipd bind --busid <BUSID>
+```
+
+通过网页导入 WireGuard 配置时，网关会拒绝任意命令型 hook，并在 `[Interface]` 段强制使用 `Table=off`，因此不会替换 WSL 默认路由。仅在该接口被分配给已启用的国家出口后，项目流量才会通过它；每个国家使用独立的标记和路由表，多条 WireGuard 出口不会互相覆盖。
+
 > 本项目直接控制蜂窝模块、SIM、网络路由和 IMS。运营商是否开放 Wi‑Fi Calling 仍取决于套餐、区域、设备身份和网络策略。
 
 ## 系统架构

@@ -362,6 +362,7 @@ export function EgressPage({ showToast }) {
   const [revealSensitive, setRevealSensitive] = useState(false)
   const [saving, setSaving] = useState(false)
   const [profileTests, setProfileTests] = useState({})
+  const [importingWireGuard, setImportingWireGuard] = useState(false)
   const loadLive = () => api.egressStatus().then(setLive).catch(() => setLive(null))
   useEffect(() => {
     api.settings().then(setS).catch(() => setS({ proxy: {} }))
@@ -382,24 +383,32 @@ export function EgressPage({ showToast }) {
   const proxy = s.proxy || { profiles: {}, exits: {} }
   const patch = p => setS(x => ({ ...x, proxy: { ...x.proxy, ...p } }))
   const profiles = proxy.profiles || {}
-  const profileTypeLabel = profile => profile.type === 'subscription' ? t('Subscription link') : profile.type === 'node' ? t('Individual node') : profile.type === 'existing' ? t('Imported outbound') : 'SOCKS5'
+  const profileTypeLabel = profile => profile.type === 'subscription' ? t('Subscription link') : profile.type === 'node' ? t('Individual node') : profile.type === 'existing' ? t('Imported outbound') : profile.type === 'wireguard_interface' ? t('WireGuard system interface') : 'SOCKS5'
   const patchExit = (country, p) => patch({ exits: { ...(proxy.exits || {}), [country]: { ...(proxy.exits?.[country] || {}), ...p } } })
   const patchProfile = (id, p) => patch({ profiles: { ...profiles, [id]: { ...profiles[id], ...p } } })
   const removeExit = country => { const exits = { ...(proxy.exits || {}) }; delete exits[country]; patch({ exits }) }
-  const openAddProfile = () => setProfileDraft({ type: 'subscription', name: '', url: '', refresh_minutes: 30, value: '', server: '', port: 1080, username: '', password: '' })
-  const confirmAddProfile = () => {
+  const openAddProfile = () => setProfileDraft({ type: 'subscription', name: '', url: '', refresh_minutes: 30, value: '', server: '', port: 1080, username: '', password: '', interface: '', wireguard_config: '' })
+  const confirmAddProfile = async () => {
+    if (profileDraft?.type === 'wireguard_interface' && profileDraft.wireguard_config.trim()) {
+      setImportingWireGuard(true)
+      try { await api.importWireGuard(profileDraft.interface.trim(), profileDraft.wireguard_config) }
+      catch (error) { showToast(error.message); setImportingWireGuard(false); return }
+      setImportingWireGuard(false)
+    }
     if (!profileDraft) return
     const id = `proxy-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
-    const name = profileDraft.name.trim() || t(profileDraft.type === 'subscription' ? 'New subscription' : profileDraft.type === 'node' ? 'New node' : 'New SOCKS5 proxy')
+    const name = profileDraft.name.trim() || t(profileDraft.type === 'subscription' ? 'New subscription' : profileDraft.type === 'node' ? 'New node' : profileDraft.type === 'wireguard_interface' ? 'New WireGuard interface' : 'New SOCKS5 proxy')
     const detail = profileDraft.type === 'subscription'
       ? { url: profileDraft.url.trim(), refresh_minutes: profileDraft.refresh_minutes || 30 }
       : profileDraft.type === 'node'
         ? { value: profileDraft.value.trim() }
-        : { server: profileDraft.server.trim(), port: profileDraft.port || 1080, username: profileDraft.username, password: profileDraft.password }
+        : profileDraft.type === 'wireguard_interface'
+          ? { interface: profileDraft.interface.trim() }
+          : { server: profileDraft.server.trim(), port: profileDraft.port || 1080, username: profileDraft.username, password: profileDraft.password }
     patch({ profiles: { ...profiles, [id]: { name, type: profileDraft.type, ...detail } } })
     setProfileDraft(null)
   }
-  const draftReady = !!profileDraft && (profileDraft.type === 'subscription' ? !!profileDraft.url.trim() : profileDraft.type === 'node' ? !!profileDraft.value.trim() : !!profileDraft.server.trim() && +profileDraft.port > 0 && +profileDraft.port <= 65535)
+  const draftReady = !!profileDraft && (profileDraft.type === 'subscription' ? !!profileDraft.url.trim() : profileDraft.type === 'node' ? !!profileDraft.value.trim() : profileDraft.type === 'wireguard_interface' ? /^[A-Za-z0-9_.-]{1,15}$/.test(profileDraft.interface.trim()) : !!profileDraft.server.trim() && +profileDraft.port > 0 && +profileDraft.port <= 65535)
   const removeProfile = id => {
     const countries = Object.entries(proxy.exits || {}).filter(([, ex]) => ex.profile_id === id).map(([country]) => country.toUpperCase())
     if (countries.length) { showToast(t('This proxy is used by: {countries}', { countries: countries.join(', ') })); return }
@@ -438,6 +447,7 @@ export function EgressPage({ showToast }) {
           {profile.type === 'node' && <><label>{t('Node share link')}</label><input className="mono" type={revealSensitive ? 'text' : 'password'} autoComplete="off" value={profile.value || ''} onChange={e => patchProfile(id, { value: e.target.value })} placeholder="vless://…" /></>}
           {profile.type === 'socks5' && <><label>{t('Server')}</label><input className="mono" type={revealSensitive ? 'text' : 'password'} value={profile.server || ''} onChange={e => patchProfile(id, { server: e.target.value })} /></>}
           {profile.type === 'existing' && <><label>{t('Existing outbound tag')}</label><input value={profile.outbound_tag || ''} onChange={e => patchProfile(id, { outbound_tag: e.target.value })} /></>}
+          {profile.type === 'wireguard_interface' && <><label>{t('Interface name')}</label><input className="mono" value={profile.interface || ''} onChange={e => patchProfile(id, { interface: e.target.value })} placeholder="vpnuk-uk8" /></>}
         </div>
         <div className="u-proxy-secondary">
           {profile.type === 'subscription' && <><label>{t('Refresh interval')}</label><div className="u-number-suffix"><input type="number" min="1" value={profile.refresh_minutes || 30} onChange={e => patchProfile(id, { refresh_minutes: +e.target.value })} /><span>{t('minutes')}</span></div></>}
@@ -495,15 +505,17 @@ export function EgressPage({ showToast }) {
             ['subscription', t('Subscription link'), t('Paste a Clash subscription URL. The gateway fetches it automatically, extracts compatible nodes, and refreshes it on schedule.'), '📡'],
             ['node', t('Individual node'), t('Paste one share link. Supports VLESS Reality/XHTTP, Trojan, Hysteria2, Shadowsocks and VMess.'), '🔗'],
             ['socks5', 'SOCKS5', t('Connect to a SOCKS5 server directly. It must support UDP ASSOCIATE for VoWiFi.'), '🧦'],
+            ['wireguard_interface', t('WireGuard system interface'), t('WireGuard traffic is isolated to the gateway. Imported configurations are forced to project-only routing and do not replace the WSL default route.'), '🔐'],
           ].map(([type, title, detail, icon]) => <button type="button" key={type} className={`u-proxy-type ${profileDraft.type === type ? 'active' : ''}`} onClick={() => setProfileDraft({ ...profileDraft, type })}><span className="u-proxy-type-icon" aria-hidden="true">{icon}</span><b>{title}</b><small>{detail}</small></button>)}
         </div>
         <div className="u-proxy-modal-form">
-          <label>{t('Name')} <span>{t('optional')}</span></label><input autoFocus value={profileDraft.name} onChange={e => setProfileDraft({ ...profileDraft, name: e.target.value })} placeholder={t(profileDraft.type === 'subscription' ? 'New subscription' : profileDraft.type === 'node' ? 'New node' : 'New SOCKS5 proxy')} />
+          <label>{t('Name')} <span>{t('optional')}</span></label><input autoFocus value={profileDraft.name} onChange={e => setProfileDraft({ ...profileDraft, name: e.target.value })} placeholder={t(profileDraft.type === 'subscription' ? 'New subscription' : profileDraft.type === 'node' ? 'New node' : profileDraft.type === 'wireguard_interface' ? 'New WireGuard interface' : 'New SOCKS5 proxy')} />
           {profileDraft.type === 'subscription' && <><label>{t('Subscription URL')}</label><input className="mono" type={revealSensitive ? 'text' : 'password'} autoComplete="off" value={profileDraft.url} onChange={e => setProfileDraft({ ...profileDraft, url: e.target.value })} placeholder="https://…" /><label>{t('Refresh interval (minutes)')}</label><input type="number" min="1" value={profileDraft.refresh_minutes} onChange={e => setProfileDraft({ ...profileDraft, refresh_minutes: +e.target.value })} /></>}
           {profileDraft.type === 'node' && <><label>{t('Node share link')}</label><textarea className="mono" rows="4" value={profileDraft.value} onChange={e => setProfileDraft({ ...profileDraft, value: e.target.value })} placeholder="vless://…" /></>}
           {profileDraft.type === 'socks5' && <div className="u-form-grid"><div><label>{t('Server')}</label><input className="mono" value={profileDraft.server} onChange={e => setProfileDraft({ ...profileDraft, server: e.target.value })} placeholder="proxy.example.com" /></div><div><label>{t('Port')}</label><input type="number" min="1" max="65535" value={profileDraft.port} onChange={e => setProfileDraft({ ...profileDraft, port: +e.target.value })} /></div><div><label>{t('Username (optional)')}</label><input value={profileDraft.username} onChange={e => setProfileDraft({ ...profileDraft, username: e.target.value })} /></div><div><label>{t('Password (optional)')}</label><input type={revealSensitive ? 'text' : 'password'} autoComplete="new-password" value={profileDraft.password} onChange={e => setProfileDraft({ ...profileDraft, password: e.target.value })} /></div></div>}
+          {profileDraft.type === 'wireguard_interface' && <><label>{t('Interface name')}</label><input className="mono" value={profileDraft.interface} onChange={e => setProfileDraft({ ...profileDraft, interface: e.target.value })} placeholder="vpnuk-uk8" /><label>{t('WireGuard configuration (.conf)')}</label><textarea className="mono" rows="9" value={profileDraft.wireguard_config} onChange={e => setProfileDraft({ ...profileDraft, wireguard_config: e.target.value })} placeholder={t('Paste a standard WireGuard .conf file')} /><p className="u-note">{t('WireGuard traffic is isolated to the gateway. Imported configurations are forced to project-only routing and do not replace the WSL default route.')}</p></>}
         </div>
-        <div className="u-modal-actions"><button className="btn btn-ghost" onClick={() => setProfileDraft(null)}>{t('Cancel')}</button><button className="btn btn-primary" disabled={!draftReady} onClick={confirmAddProfile}>{t('Add to proxy library')}</button></div>
+        <div className="u-modal-actions"><button className="btn btn-ghost" onClick={() => setProfileDraft(null)}>{t('Cancel')}</button><button className="btn btn-primary" disabled={!draftReady || importingWireGuard} onClick={confirmAddProfile}>{t(importingWireGuard ? 'Creating WireGuard interface…' : 'Add to proxy library')}</button></div>
       </div>
     </div>}
   </div>
