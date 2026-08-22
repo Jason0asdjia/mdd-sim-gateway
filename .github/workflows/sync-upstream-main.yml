@@ -41,9 +41,22 @@ jobs:
             exit 0
           fi
 
-          # Preserve local commits. A conflict makes the job fail without pushing,
-          # so manual review is required rather than risking an incorrect merge.
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git merge --no-edit upstream/main
+          # GitHub's built-in token cannot push changes to workflow files. Keep the
+          # fork's workflows authoritative, while importing all other upstream code.
+          workflow_backup=$(mktemp -d)
+          cp -a .github/workflows/. "$workflow_backup"/
+          cleanup() { rm -rf "$workflow_backup"; }
+          trap cleanup EXIT
+
+          if ! git merge --no-edit --no-commit upstream/main; then
+            echo "Upstream merge has conflicts; no commit will be pushed."
+            git merge --abort || true
+            exit 1
+          fi
+
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp -a "$workflow_backup"/. .github/workflows/
+          git add -A .github/workflows
+          git commit --no-edit -m "chore：同步上游 main（保留本仓库工作流）"
           git push origin HEAD:main
