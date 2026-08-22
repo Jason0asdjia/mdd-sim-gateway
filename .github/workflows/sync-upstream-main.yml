@@ -62,5 +62,12 @@ jobs:
           mkdir -p .github/workflows
           cp -a "$workflow_backup"/. .github/workflows/
           git add -A .github/workflows
+          # The upstream may have no non-workflow changes after the merge. In
+          # that case restoring our workflows leaves nothing to commit, which
+          # is a successful no-op rather than an error.
+          if git diff --cached --quiet; then
+            echo "No non-workflow upstream changes to synchronize."
+            exit 0
+          fi
           git commit --no-edit -m "chore：同步上游 main（保留本仓库工作流）"
           git push origin HEAD:main
