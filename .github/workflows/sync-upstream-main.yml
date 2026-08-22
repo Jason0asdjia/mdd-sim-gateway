@@ -48,6 +48,10 @@ jobs:
           cleanup() { rm -rf "$workflow_backup"; }
           trap cleanup EXIT
 
+          # Configure the bot identity before creating the merge commit.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           if ! git merge --no-edit --no-commit upstream/main; then
             echo "Upstream merge has conflicts; no commit will be pushed."
             git merge --abort || true
