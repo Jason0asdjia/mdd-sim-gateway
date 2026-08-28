@@ -2,6 +2,26 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [1.5.4] - 2026-08-28
+
+### Fixed
+
+- Fixed update-scope selection so “all versions” follows the approved latest Release while
+  “main versions only” can still install its independently configured stable Release by tag after
+  newer patches are published. The legacy promotion field remains synchronized so gateways older
+  than v1.5.4 can receive the approved patch.
+
+- [Issue #21](https://github.com/MddIdd/mdd-sim-gateway/issues/21): a VoWiFi health rebuild
+  could remove its failed container, sample the reader while its card identity was briefly
+  unavailable, and then erase the only automatic retry timer. A transient card-cache miss now
+  keeps a bounded eligibility retry, while an actual removal event or a disabled VoWiFi switch
+  still cancels recovery.
+
+- Redacted support bundles could retain operator-controlled proxy profile labels and node values,
+  the active exit-node label, and host interface addresses because those generic field names were
+  not sensitive outside their document context. Redaction now follows each field's path, hides
+  profile identifiers and references, and keeps the health evidence needed to diagnose a rebuild.
+
 ## [1.5.3] - 2026-08-27
 
 ### Changed
